@@ -113,3 +113,189 @@
     resolution-details: (optional (string-utf8 500))
   }
 )
+;; User positions in markets
+(define-map positions
+  { market-id: uint, trader: principal }
+  {
+    outcome-stakes: (list 10 { 
+      outcome-index: uint, 
+      shares: uint, 
+      avg-price: uint 
+    }),
+    total-staked: uint,
+    total-shares: uint,
+    initial-position-time: uint,
+    last-update-time: uint,
+    rewards-withdrawn: bool
+  }
+)
+
+;; User reputation
+(define-map user-reputation
+  { user: principal }
+  {
+    reputation-score: uint, ;; 0-100 scale
+    markets-created: uint,
+    markets-participated: uint,
+    successful-predictions: uint,
+    total-stake-history: uint,
+    total-earnings: uint,
+    disputed-markets: uint,
+    successful-disputes: uint,
+    stake-at-risk: uint,
+    last-active-block: uint
+  }
+)
+
+;; Disputes
+(define-map disputes
+  { dispute-id: uint }
+  {
+    market-id: uint,
+    disputer: principal,
+    dispute-reason: (string-utf8 1000),
+    evidence-url: (string-utf8 256),
+    stake-amount: uint,
+    proposed-outcome-index: (optional uint),
+    proposed-scalar-value: (optional uint),
+    dispute-creation-block: uint,
+    votes-for: uint,
+    votes-against: uint,
+    status: uint,
+    resolution-block: (optional uint),
+    resolution-notes: (optional (string-utf8 500))
+  }
+)
+
+;; Market maker liquidity pools
+(define-map liquidity-providers
+  { market-id: uint, provider: principal }
+  {
+    liquidity-amount: uint,
+    pool-share-percent: uint, ;; Basis points
+    added-at-block: uint,
+    last-update-block: uint,
+    fees-earned: uint,
+    fees-withdrawn: uint
+  }
+)
+
+;; Trade history for analytics
+(define-map trades
+  { market-id: uint, trade-index: uint }
+  {
+    trader: principal,
+    outcome-index: uint,
+    shares: uint,
+    price: uint,
+    is-buy: bool,
+    trade-block: uint,
+    fee-paid: uint
+  }
+)
+
+;; Trade count for each market
+(define-map market-trade-count
+  { market-id: uint }
+  { count: uint }
+)
+
+;; Oracle results
+(define-map oracle-results
+  { market-id: uint, oracle-id: uint }
+  {
+    reported-outcome-index: (optional uint),
+    reported-scalar-value: (optional uint),
+    result-block: uint,
+    result-description: (string-utf8 500),
+    verification-proof: (buff 256),
+    confirming-principals: (list 10 principal)
+  }
+)
+
+;; Read-only functions
+
+;; Get market details
+(define-read-only (get-market (market-id uint))
+  (map-get? markets { market-id: market-id })
+)
+
+;; Get oracle details
+(define-read-only (get-oracle (oracle-id uint))
+  (map-get? oracles { oracle-id: oracle-id })
+)
+
+;; Get user position in a market
+(define-read-only (get-position (market-id uint) (trader principal))
+  (map-get? positions { market-id: market-id, trader: trader })
+)
+
+;; Get user reputation
+(define-read-only (get-user-reputation (user principal))
+  (default-to {
+    reputation-score: u50,
+    markets-created: u0,
+    markets-participated: u0,
+    successful-predictions: u0,
+    total-stake-history: u0,
+    total-earnings: u0,
+    disputed-markets: u0,
+    successful-disputes: u0,
+    stake-at-risk: u0,
+    last-active-block: u0
+  } (map-get? user-reputation { user: user }))
+)
+
+;; Get dispute details
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id })
+)
+
+;; Get liquidity provider details
+(define-read-only (get-liquidity-provider (market-id uint) (provider principal))
+  (map-get? liquidity-providers { market-id: market-id, provider: provider })
+)
+
+;; Calculate rewards for a position
+(define-read-only (calculate-rewards (market-id uint) (trader principal))
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (position (unwrap! (get-position market-id trader) (err ERR-POSITION-NOT-FOUND)))
+      (winning-outcome (unwrap! (get resolved-outcome-index market) (err ERR-MARKET-NOT-RESOLVED)))
+    )
+    
+    ;; Check if market is resolved
+    (asserts! (is-eq (get status market) MARKET-STATUS-RESOLVED) (err ERR-MARKET-NOT-RESOLVED))
+    
+    ;; Check if rewards already withdrawn
+    (asserts! (not (get rewards-withdrawn position)) (err ERR-ALREADY-WITHDRAWN))
+    
+    ;; Calculate rewards based on market type
+    (if (is-eq (get market-type market) MARKET-TYPE-BINARY)
+      ;; Binary markets: winner takes all
+      (let
+        (
+          (winning-shares (default-to u0 (get-shares-for-outcome position winning-outcome)))
+          (reward-amount (if (> winning-shares u0)
+                          (/ (* winning-shares (get total-liquidity market)) 
+                             (default-to u1 (get-total-shares-for-outcome market winning-outcome)))
+                          u0))
+        )
+        (ok reward-amount)
+      )
+      
+      ;; Categorical markets: similar to binary
+      (let
+        (
+          (winning-shares (default-to u0 (get-shares-for-outcome position winning-outcome)))
+          (reward-amount (if (> winning-shares u0)
+                          (/ (* winning-shares (get total-liquidity market)) 
+                             (default-to u1 (get-total-shares-for-outcome market winning-outcome)))
+                          u0))
+        )
+        (ok reward-amount)
+      )
+    )
+  )
+)
