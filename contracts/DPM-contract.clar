@@ -299,3 +299,37 @@
     )
   )
 )
+        {
+          outcome-stakes: (update-outcome-stakes 
+                         (get outcome-stakes current-position) 
+                         outcome-index 
+                         shares-bought 
+                         (get avg-price price-data)),
+          total-staked: (+ (get total-staked current-position) amount-stx),
+          total-shares: (+ (get total-shares current-position) shares-bought),
+          initial-position-time: (if (is-eq (get total-staked current-position) u0)
+                                 block-height
+                                 (get initial-position-time current-position)),
+          last-update-time: block-height,
+          rewards-withdrawn: false
+        }
+      )
+      
+      ;; Record trade
+      (let
+        (
+          (trade-count (default-to { count: u0 } (map-get? market-trade-count { market-id: market-id })))
+        )
+        (map-set trades
+          { market-id: market-id, trade-index: (get count trade-count) }
+          {
+            trader: tx-sender,
+            outcome-index: outcome-index,
+            shares: shares-bought,
+            price: (get avg-price price-data),
+            is-buy: true,
+            trade-block: block-height,
+            fee-paid: trading-fee
+          }
+        )
+
