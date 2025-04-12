@@ -333,3 +333,106 @@
           }
         )
 
+
+(map-set market-trade-count
+          { market-id: market-id }
+          { count: (+ (get count trade-count) u1) }
+        )
+      )
+      
+      ;; Distribute trading fee to liquidity providers (simplified)
+      (distribute-trading-fee market-id trading-fee)
+      
+      ;; Update user reputation
+      (let
+        (
+          (user-rep (get-user-reputation tx-sender))
+        )
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge user-rep {
+            markets-participated: (+ (get markets-participated user-rep) 
+                                 (if (is-eq (get total-staked current-position) u0) u1 u0)),
+            total-stake-history: (+ (get total-stake-history user-rep) amount-stx),
+            last-active-block: block-height
+          })
+        )
+      )
+      
+      (ok shares-bought)
+    )
+  )
+)
+
+;; Helper to update outcome data with new price and shares
+(define-private (update-outcome-data 
+  (outcomes (list 10 { name: (string-utf8 50), current-price: uint, total-shares: uint }))
+  (outcome-index uint)
+  (new-price uint)
+  (additional-shares uint)
+)
+  (map update-outcome outcomes outcome-index new-price additional-shares)
+)
+
+;; Helper to update a specific outcome
+(define-private (update-outcome 
+  (outcome { name: (string-utf8 50), current-price: uint, total-shares: uint })
+  (index-to-update uint)
+  (new-price uint)
+  (additional-shares uint)
+  (current-index uint)
+)
+  (if (is-eq current-index index-to-update)
+    {
+      name: (get name outcome),
+      current-price: new-price,
+      total-shares: (+ (get total-shares outcome) additional-shares)
+    }
+    outcome
+  )
+)
+
+;; Helper to update outcome stakes for a user
+(define-private (update-outcome-stakes
+  (stakes (list 10 { outcome-index: uint, shares: uint, avg-price: uint }))
+  (outcome-index uint)
+  (additional-shares uint)
+  (price uint)
+)
+  (match (find-outcome-stake stakes outcome-index)
+    existing-stake
+    (let
+      (
+        (existing-index (get outcome-index existing-stake))
+        (existing-shares (get shares existing-stake))
+        (existing-price (get avg-price existing-stake))
+        (total-shares (+ existing-shares additional-shares))
+        (new-avg-price (/ (+ (* existing-shares existing-price) (* additional-shares price)) total-shares))
+      )
+      (map update-stake stakes existing-index total-shares new-avg-price)
+    )
+    ;; No existing stake, add new one
+    (append stakes {
+      outcome-index: outcome-index,
+      shares: additional-shares,
+      avg-price: price
+    })
+  )
+)
+
+;; Helper to update a specific stake
+(define-private (update-stake
+  (stake { outcome-index: uint, shares: uint, avg-price: uint })
+  (index-to-update uint)
+  (new-shares uint)
+  (new-price uint)
+)
+  (if (is-eq (get outcome-index stake) index-to-update)
+    {
+      outcome-index: index-to-update,
+      shares: new-shares,
+      avg-price: new-price
+    }
+    stake
+  )
+)
