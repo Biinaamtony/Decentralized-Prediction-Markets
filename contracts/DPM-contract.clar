@@ -333,3 +333,766 @@
           }
         )
 
+
+(map-set market-trade-count
+          { market-id: market-id }
+          { count: (+ (get count trade-count) u1) }
+        )
+      )
+      
+      ;; Distribute trading fee to liquidity providers (simplified)
+      (distribute-trading-fee market-id trading-fee)
+      
+      ;; Update user reputation
+      (let
+        (
+          (user-rep (get-user-reputation tx-sender))
+        )
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge user-rep {
+            markets-participated: (+ (get markets-participated user-rep) 
+                                 (if (is-eq (get total-staked current-position) u0) u1 u0)),
+            total-stake-history: (+ (get total-stake-history user-rep) amount-stx),
+            last-active-block: block-height
+          })
+        )
+      )
+      
+      (ok shares-bought)
+    )
+  )
+)
+
+;; Helper to update outcome data with new price and shares
+(define-private (update-outcome-data 
+  (outcomes (list 10 { name: (string-utf8 50), current-price: uint, total-shares: uint }))
+  (outcome-index uint)
+  (new-price uint)
+  (additional-shares uint)
+)
+  (map update-outcome outcomes outcome-index new-price additional-shares)
+)
+
+;; Helper to update a specific outcome
+(define-private (update-outcome 
+  (outcome { name: (string-utf8 50), current-price: uint, total-shares: uint })
+  (index-to-update uint)
+  (new-price uint)
+  (additional-shares uint)
+  (current-index uint)
+)
+  (if (is-eq current-index index-to-update)
+    {
+      name: (get name outcome),
+      current-price: new-price,
+      total-shares: (+ (get total-shares outcome) additional-shares)
+    }
+    outcome
+  )
+)
+
+;; Helper to update outcome stakes for a user
+(define-private (update-outcome-stakes
+  (stakes (list 10 { outcome-index: uint, shares: uint, avg-price: uint }))
+  (outcome-index uint)
+  (additional-shares uint)
+  (price uint)
+)
+  (match (find-outcome-stake stakes outcome-index)
+    existing-stake
+    (let
+      (
+        (existing-index (get outcome-index existing-stake))
+        (existing-shares (get shares existing-stake))
+        (existing-price (get avg-price existing-stake))
+        (total-shares (+ existing-shares additional-shares))
+        (new-avg-price (/ (+ (* existing-shares existing-price) (* additional-shares price)) total-shares))
+      )
+      (map update-stake stakes existing-index total-shares new-avg-price)
+    )
+    ;; No existing stake, add new one
+    (append stakes {
+      outcome-index: outcome-index,
+      shares: additional-shares,
+      avg-price: price
+    })
+  )
+)
+
+;; Helper to update a specific stake
+(define-private (update-stake
+  (stake { outcome-index: uint, shares: uint, avg-price: uint })
+  (index-to-update uint)
+  (new-shares uint)
+  (new-price uint)
+)
+  (if (is-eq (get outcome-index stake) index-to-update)
+    {
+      outcome-index: index-to-update,
+      shares: new-shares,
+      avg-price: new-price
+    }
+    stake
+  )
+)
+;; Helper to distribute trading fees to liquidity providers
+(define-private (distribute-trading-fee (market-id uint) (fee-amount uint))
+  ;; In a complete implementation, this would distribute fees proportionally to all providers
+  ;; For simplicity, we just track the fee here
+  (let
+    (
+      (market (unwrap! (get-market market-id) false))
+      (creator (get creator market))
+      (creator-pool (default-to 
+                   { 
+                     liquidity-amount: u0, 
+                     pool-share-percent: u0, 
+                     added-at-block: u0,
+                     last-update-block: u0,
+                     fees-earned: u0,
+                     fees-withdrawn: u0 
+                   } 
+                   (map-get? liquidity-providers { market-id: market-id, provider: creator })))
+    )
+    
+    (map-set liquidity-providers
+      { market-id: market-id, provider: creator }
+      (merge creator-pool {
+        fees-earned: (+ (get fees-earned creator-pool) fee-amount),
+        last-update-block: block-height
+      })
+    )
+    
+    true
+  )
+)
+
+;; Provide liquidity to a market
+(define-public (provide-liquidity (market-id uint) (amount uint))
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (current-liquidity (get total-liquidity market))
+      (provider-data (default-to 
+                    { 
+                      liquidity-amount: u0, 
+                      pool-share-percent: u0, 
+                      added-at-block: block-height,
+                      last-update-block: block-height,
+                      fees-earned: u0,
+                      fees-withdrawn: u0 
+                    } 
+                    (map-get? liquidity-providers { market-id: market-id, provider: tx-sender })))
+    )
+    
+    ;; Check market status
+    (asserts! (is-eq (get status market) MARKET-STATUS-ACTIVE) (err ERR-MARKET-INACTIVE))
+    
+    ;; Check market closing time
+    (asserts! (< block-height (get close-block market)) (err ERR-MARKET-CLOSED))
+    
+    ;; Transfer STX from provider
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    ;; Calculate new pool share
+    (let
+      (
+        (new-total-liquidity (+ current-liquidity amount))
+        (new-provider-amount (+ (get liquidity-amount provider-data) amount))
+        (new-share-percent (/ (* new-provider-amount u10000) new-total-liquidity))
+        (existing-providers (map-get? liquidity-providers { market-id: market-id, provider: (get creator market) }))
+      )
+      
+      ;; Update market total liquidity
+      (map-set markets
+        { market-id: market-id }
+        (merge market {
+          total-liquidity: new-total-liquidity
+        })
+      )
+      
+      ;; Update provider data
+      (map-set liquidity-providers
+        { market-id: market-id, provider: tx-sender }
+        {
+          liquidity-amount: new-provider-amount,
+          pool-share-percent: new-share-percent,
+          added-at-block: (if (is-eq (get liquidity-amount provider-data) u0)
+                           block-height
+                           (get added-at-block provider-data)),
+          last-update-block: block-height,
+          fees-earned: (get fees-earned provider-data),
+          fees-withdrawn: (get fees-withdrawn provider-data)
+        }
+      )
+      
+      ;; Update creator's share if needed
+      (match existing-providers
+        creator-pool
+        (let
+          (
+            (creator-new-share (/ (* (get liquidity-amount creator-pool) u10000) new-total-liquidity))
+          )
+          (map-set liquidity-providers
+            { market-id: market-id, provider: (get creator market) }
+            (merge creator-pool {
+              pool-share-percent: creator-new-share,
+              last-update-block: block-height
+            })
+          )
+        )
+        true
+      )
+      
+      ;; Update user reputation
+      (let
+        (
+          (user-rep (get-user-reputation tx-sender))
+        )
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge user-rep {
+            markets-participated: (+ (get markets-participated user-rep) 
+                                 (if (is-eq (get liquidity-amount provider-data) u0) u1 u0)),
+            total-stake-history: (+ (get total-stake-history user-rep) amount),
+            last-active-block: block-height
+          })
+        )
+      )
+      
+      (ok new-share-percent)
+    )
+  )
+)
+
+;; Close a market (automatic after close-block or by oracle)
+(define-public (close-market (market-id uint))
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+    )
+    
+    ;; Check if market can be closed (past close time or called by oracle)
+    (asserts! (or 
+              (>= block-height (get close-block market))
+              (is-eq tx-sender (get principal (unwrap! (get-oracle (get oracle-id market)) (err ERR-ORACLE-NOT-REGISTERED))))
+              (is-eq tx-sender (var-get contract-owner)))
+              (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if market is still active
+    (asserts! (is-eq (get status market) MARKET-STATUS-ACTIVE) (err ERR-MARKET-CLOSED))
+    
+    ;; Update market status
+    (map-set markets
+      { market-id: market-id }
+      (merge market {
+        status: MARKET-STATUS-CLOSED
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Report market outcome by oracle
+(define-public (report-outcome 
+  (market-id uint) 
+  (outcome-index (optional uint))
+  (scalar-value (optional uint))
+  (result-description (string-utf8 500))
+  (verification-proof (buff 256))
+)
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (oracle-id (get oracle-id market))
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+    )
+    
+    ;; Check if market is closed
+    (asserts! (is-eq (get status market) MARKET-STATUS-CLOSED) (err ERR-MARKET-NOT-CLOSED))
+    
+    ;; Check if report is from the assigned oracle
+    (asserts! (is-eq tx-sender (get principal oracle)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Validate outcome based on market type
+    (if (is-eq (get market-type market) MARKET-TYPE-SCALAR)
+      ;; Scalar market - validate scalar value
+      (match scalar-value
+        value (asserts! (and 
+                        (>= value (unwrap-panic (get scalar-lower-bound market)))
+                        (<= value (unwrap-panic (get scalar-upper-bound market))))
+                       (err ERR-INVALID-PARAMETERS))
+        (err ERR-INVALID-PARAMETERS)
+      )
+      ;; Binary/Categorical market - validate outcome index
+      (match outcome-index
+        index (asserts! (< index (get outcome-count market)) (err ERR-OUTCOME-NOT-FOUND))
+        (err ERR-INVALID-PARAMETERS)
+      )
+    )
+    
+    ;; Record oracle result
+    (map-set oracle-results
+      { market-id: market-id, oracle-id: oracle-id }
+      {
+        reported-outcome-index: outcome-index,
+        reported-scalar-value: scalar-value,
+        result-block: block-height,
+        result-description: result-description,
+        verification-proof: verification-proof,
+        confirming-principals: (list (get principal oracle))
+      }
+    )
+    
+    ;; For Multisig oracle method, we need multiple confirmations
+    (if (is-eq (get verification-method oracle) ORACLE-METHOD-MULTISIG)
+      ;; Just record the result, don't resolve yet
+      (ok false)
+      ;; For single oracle methods, resolve immediately
+      (resolve-market market-id outcome-index scalar-value result-description)
+    )
+  )
+)
+
+;; Confirm oracle result (for multisig oracle method)
+(define-public (confirm-oracle-result (market-id uint))
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (oracle-id (get oracle-id market))
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+      (result (unwrap! (map-get? oracle-results { market-id: market-id, oracle-id: oracle-id }) 
+                      (err ERR-OUTCOME-NOT-DETERMINED)))
+    )
+    
+    ;; Check if market is closed
+    (asserts! (is-eq (get status market) MARKET-STATUS-CLOSED) (err ERR-MARKET-NOT-CLOSED))
+    
+    ;; Check if oracle is multisig
+    (asserts! (is-eq (get verification-method oracle) ORACLE-METHOD-MULTISIG) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Check if caller is a multisig member
+    (asserts! (is-some (index-of (get multisig-members oracle) tx-sender)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if caller hasn't already confirmed
+    (asserts! (is-none (index-of (get confirming-principals result) tx-sender)) (err ERR-ALREADY-CONFIRMED))
+    
+    ;; Add confirmation
+    (let
+      (
+        (updated-confirmations (append (get confirming-principals result) tx-sender))
+      )
+      (map-set oracle-results
+        { market-id: market-id, oracle-id: oracle-id }
+        (merge result {
+          confirming-principals: updated-confirmations
+        })
+      )
+      
+
+    ;; Check if we have enough confirmations to resolve
+      (if (>= (len updated-confirmations) (get required-signatures oracle))
+        (resolve-market 
+          market-id 
+          (get reported-outcome-index result) 
+          (get reported-scalar-value result) 
+          (get result-description result))
+        (ok false)
+      )
+    )
+  )
+)
+
+;; Private function to resolve market
+(define-private (resolve-market 
+  (market-id uint) 
+  (outcome-index (optional uint))
+  (scalar-value (optional uint))
+  (resolution-details (string-utf8 500))
+)
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (oracle-id (get oracle-id market))
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+    )
+    
+    ;; Update market status and result
+    (map-set markets
+      { market-id: market-id }
+      (merge market {
+        status: MARKET-STATUS-RESOLVED,
+        resolved-outcome-index: outcome-index,
+        scalar-resolution-value: scalar-value,
+        resolution-block: (some block-height),
+        dispute-period-end: (some (+ block-height (var-get dispute-period-length))),
+        resolution-details: (some resolution-details)
+      })
+    )
+    
+    ;; Update oracle stats
+    (map-set oracles
+      { oracle-id: oracle-id }
+      (merge oracle {
+        markets-resolved: (+ (get markets-resolved oracle) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Claim rewards after market resolution
+(define-public (claim-rewards (market-id uint))
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (position (unwrap! (get-position market-id tx-sender) (err ERR-NO-POSITION)))
+      (rewards-amount (unwrap! (calculate-rewards market-id tx-sender) (err ERR-NO-REWARDS-AVAILABLE)))
+    )
+    
+    ;; Check if market is resolved
+    (asserts! (is-eq (get status market) MARKET-STATUS-RESOLVED) (err ERR-MARKET-NOT-RESOLVED))
+    
+    ;; Check if dispute period has ended
+    (asserts! (>= block-height (unwrap! (get dispute-period-end market) (err ERR-MARKET-NOT-RESOLVED))) 
+             (err ERR-MARKET-IN-DISPUTE))
+    
+    ;; Check if rewards haven't been withdrawn
+    (asserts! (not (get rewards-withdrawn position)) (err ERR-ALREADY-WITHDRAWN))
+    
+    ;; Check if there are rewards to claim
+    (asserts! (> rewards-amount u0) (err ERR-NO-REWARDS-AVAILABLE))
+    
+    ;; Transfer rewards
+    (try! (as-contract (stx-transfer? rewards-amount tx-sender tx-sender)))
+    
+    ;; Update position to mark rewards as withdrawn
+    (map-set positions
+      { market-id: market-id, trader: tx-sender }
+      (merge position {
+        rewards-withdrawn: true
+      })
+    )
+    
+    ;; Update user reputation for successful prediction
+    (let
+      (
+        (user-rep (get-user-reputation tx-sender))
+        (winning-outcome (unwrap! (get resolved-outcome-index market) (err ERR-MARKET-NOT-RESOLVED)))
+        (outcome-shares (default-to u0 (get-shares-for-outcome position winning-outcome)))
+      )
+      (when (> outcome-shares u0)
+        (map-set user-reputation
+          { user: tx-sender }
+          (merge user-rep {
+            successful-predictions: (+ (get successful-predictions user-rep) u1),
+            total-earnings: (+ (get total-earnings user-rep) rewards-amount),
+            stake-at-risk: (- (get stake-at-risk user-rep) (get total-staked position)),
+            last-active-block: block-height
+          })
+        )
+      )
+    )
+    
+    (ok rewards-amount)
+  )
+)
+
+;; Withdraw liquidity provider fees
+(define-public (withdraw-fees (market-id uint))
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (provider-data (unwrap! (get-liquidity-provider market-id tx-sender) (err ERR-POSITION-NOT-FOUND)))
+      (available-fees (- (get fees-earned provider-data) (get fees-withdrawn provider-data)))
+    )
+    
+    ;; Check if there are fees to withdraw
+    (asserts! (> available-fees u0) (err ERR-NO-REWARDS-AVAILABLE))
+    
+    ;; Transfer fees
+    (try! (as-contract (stx-transfer? available-fees tx-sender tx-sender)))
+    
+    ;; Update provider data
+    (map-set liquidity-providers
+      { market-id: market-id, provider: tx-sender }
+      (merge provider-data {
+        fees-withdrawn: (+ (get fees-withdrawn provider-data) available-fees),
+        last-update-block: block-height
+      })
+    )
+    
+    (ok available-fees)
+  )
+)
+
+;; Dispute market resolution
+(define-public (dispute-market-resolution
+  (market-id uint)
+  (dispute-reason (string-utf8 1000))
+  (evidence-url (string-utf8 256))
+  (proposed-outcome-index (optional uint))
+  (proposed-scalar-value (optional uint))
+  (stake-amount uint)
+)
+  (let
+    (
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (dispute-id (var-get next-dispute-id))
+      (position (default-to 
+               { 
+                 outcome-stakes: (list), 
+                 total-staked: u0, 
+                 total-shares: u0, 
+                 initial-position-time: u0,
+                 last-update-time: u0,
+                 rewards-withdrawn: false
+               } 
+               (get-position market-id tx-sender)))
+    )
+    
+    ;; Check if market is resolved
+    (asserts! (is-eq (get status market) MARKET-STATUS-RESOLVED) (err ERR-MARKET-NOT-RESOLVED))
+    
+    ;; Check if still in dispute period
+    (asserts! (<= block-height (unwrap! (get dispute-period-end market) (err ERR-DISPUTE-PERIOD-ENDED)))
+             (err ERR-DISPUTE-PERIOD-ENDED))
+    
+    ;; Check if not already in dispute
+    (asserts! (not (get in-dispute market)) (err ERR-ALREADY-DISPUTED))
+    
+    ;; Check if user has a position in the market
+    (asserts! (> (get total-staked position) u0) (err ERR-NO-POSITION))
+    
+    ;; Check if stake is sufficient (at least 10% of creator stake)
+    (asserts! (>= stake-amount (/ (get creator-stake market) u10)) (err ERR-INSUFFICIENT-STAKE))
+    
+    ;; Transfer dispute stake
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Create dispute
+    (map-set disputes
+      { dispute-id: dispute-id }
+      {
+        market-id: market-id,
+        disputer: tx-sender,
+        dispute-reason: dispute-reason,
+        evidence-url: evidence-url,
+        stake-amount: stake-amount,
+        proposed-outcome-index: proposed-outcome-index,
+        proposed-scalar-value: proposed-scalar-value,
+        dispute-creation-block: block-height,
+        votes-for: u0,
+        votes-against: u0,
+        status: DISPUTE-STATUS-ACTIVE,
+        resolution-block: none,
+        resolution-notes: none
+      }
+    )
+    
+    ;; Update market status
+    (map-set markets
+      { market-id: market-id }
+      (merge market {
+        status: MARKET-STATUS-DISPUTED,
+        in-dispute: true,
+        active-dispute-id: (some dispute-id)
+      })
+    )
+    
+    ;; Update user reputation
+    (let
+      (
+        (user-rep (get-user-reputation tx-sender))
+      )
+      (map-set user-reputation
+        { user: tx-sender }
+        (merge user-rep {
+          disputed-markets: (+ (get disputed-markets user-rep) u1),
+          stake-at-risk: (+ (get stake-at-risk user-rep) stake-amount),
+          last-active-block: block-height
+        })
+      )
+    )
+    
+    ;; Increment dispute ID
+    (var-set next-dispute-id (+ dispute-id u1))
+    
+    (ok dispute-id)
+  )
+)
+
+;; Vote on a dispute
+(define-public (vote-on-dispute (dispute-id uint) (vote-for bool) (weight uint))
+  (let
+    (
+      (dispute (unwrap! (get-dispute dispute-id) (err ERR-DISPUTE-NOT-FOUND)))
+      (market-id (get market-id dispute))
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (user-rep (get-user-reputation tx-sender))
+    )
+    
+    ;; Check if dispute is active
+    (asserts! (is-eq (get status dispute) DISPUTE-STATUS-ACTIVE) (err ERR-DISPUTE-ALREADY-RESOLVED))
+    
+    ;; Check if user has reputation (minimum 10)
+    (asserts! (>= (get reputation-score user-rep) u10) (err ERR-INSUFFICIENT-STAKE))
+    
+    ;; Check if weight is valid (can't exceed reputation)
+    (asserts! (<= weight (get reputation-score user-rep)) (err ERR-INSUFFICIENT-STAKE))
+    
+    ;; Update dispute votes
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        votes-for: (if vote-for 
+                    (+ (get votes-for dispute) weight)
+                    (get votes-for dispute)),
+        votes-against: (if vote-for
+                        (get votes-against dispute)
+                        (+ (get votes-against dispute) weight))
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve a dispute (only contract owner or designated arbiters)
+(define-public (resolve-dispute (dispute-id uint) (uphold-dispute bool) (resolution-notes (string-utf8 500)))
+  (let
+    (
+      (dispute (unwrap! (get-dispute dispute-id) (err ERR-DISPUTE-NOT-FOUND)))
+      (market-id (get market-id dispute))
+      (market (unwrap! (get-market market-id) (err ERR-MARKET-NOT-FOUND)))
+      (oracle-id (get oracle-id market))
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+    )
+    
+    ;; Check if caller is authorized (contract owner for now)
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if dispute is active
+    (asserts! (is-eq (get status dispute) DISPUTE-STATUS-ACTIVE) (err ERR-DISPUTE-ALREADY-RESOLVED))
+    
+    ;; Update dispute status
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute {
+        status: (if uphold-dispute DISPUTE-STATUS-RESOLVED DISPUTE-STATUS-REJECTED),
+        resolution-block: (some block-height),
+        resolution-notes: (some resolution-notes)
+      })
+    )
+    
+    ;; If dispute is upheld, update market with the proposed outcome
+    (if uphold-dispute
+      (begin
+        (map-set markets
+          { market-id: market-id }
+          (merge market {
+            status: MARKET-STATUS-RESOLVED,
+            in-dispute: false,
+            active-dispute-id: none,
+            resolved-outcome-index: (get proposed-outcome-index dispute),
+            scalar-resolution-value: (get proposed-scalar-value dispute),
+            dispute-period-end: (some (+ block-height (var-get dispute-period-length)))
+          })
+        )
+        
+        ;; Update oracle dispute count
+        (map-set oracles
+          { oracle-id: oracle-id }
+          (merge oracle {
+            disputes-raised: (+ (get disputes-raised oracle) u1)
+          })
+        )
+        
+        ;; Update user reputation for successful dispute
+        (let
+          (
+            (user-rep (get-user-reputation (get disputer dispute)))
+          )
+          (map-set user-reputation
+            { user: (get disputer dispute) }
+            (merge user-rep {
+              successful-disputes: (+ (get successful-disputes user-rep) u1)
+            })
+          )
+        )
+        
+        ;; Return the dispute stake to the disputer (plus a reward from the creator's stake)
+        (try! (as-contract (stx-transfer? 
+                         (+ (get stake-amount dispute) (/ (get creator-stake market) u10)) 
+                         tx-sender 
+                         (get disputer dispute))))
+      )
+      ;; Dispute rejected, return market to resolved state
+      (begin
+        (map-set markets
+          { market-id: market-id }
+          (merge market {
+            status: MARKET-STATUS-RESOLVED,
+            in-dispute: false,
+            active-dispute-id: none,
+            dispute-period-end: (some (+ block-height (var-get dispute-period-length)))
+          })
+        )
+        
+        ;; Transfer dispute stake to creator as compensation
+        (try! (as-contract (stx-transfer? 
+                         (get stake-amount dispute) 
+                         tx-sender 
+                         (get creator market))))
+      )
+    )
+    
+    (ok uphold-dispute)
+  )
+)
+
+;; Update platform fee percentage (only contract owner)
+(define-public (update-platform-fee (new-fee-percent uint))
+  (begin
+    ;; Only contract owner can update fee
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Check if fee is reasonable (max 5%)
+    (asserts! (<= new-fee-percent u500) (err ERR-INVALID-PARAMETERS))
+    
+    ;; Update fee
+    (var-set platform-fee-percent new-fee-percent)
+    
+    (ok true)
+  )
+)
+
+;; Update minimum market maker stake (only contract owner)
+(define-public (update-min-market-maker-stake (new-min-stake uint))
+  (begin
+    ;; Only contract owner can update
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Update minimum stake
+    (var-set min-market-maker-stake new-min-stake)
+    
+    (ok true)
+  )
+)
+
+;; Transfer contract ownership
+(define-public (transfer-ownership (new-owner principal))
+  (begin
+    ;; Only current owner can transfer
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+    
+    ;; Update owner
+    (var-set contract-owner new-owner)
+    
+    (ok true)
+  )
+)
+
